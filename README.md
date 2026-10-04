@@ -68,6 +68,9 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - `@docker-volumes`
   - `@containers-volumes`
   - `@www`
+  - `@journal-remote`
+  - `@microk8s`
+  - `@k8s-storage`
 
 - Copies the current root filesystem to `@` (excluding `/dev`, `/proc`, `/sys`, `/run`, `/mnt`, `/media`, `/lost+found`, plus — derived automatically from the mapping below — every path that gets its own subvolume).
 - Copies the content of these directories into their matching subvolumes:
@@ -99,6 +102,9 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - `/var/lib/docker/volumes` → `@docker-volumes`
   - `/var/lib/containers/storage/volumes` → `@containers-volumes`
   - `/var/www` → `@www`
+  - `/var/log/journal/remote` → `@journal-remote`
+  - `/var/snap/microk8s/common` → `@microk8s`
+  - `/var/lib/k8s-storage` → `@k8s-storage`
 
   Database and datastore subvolumes (`@mongodb`, `@mysql`, `@postgresql`, `@chroma`, `@clamav`, `@stalwart`, `@elasticsearch`, `@opensearch`, `@clickhouse`, `@cassandra`, `@couchdb`, `@neo4j`, `@rabbitmq`) as well as named Docker/Podman volumes (`@docker-volumes`, `@containers-volumes`) keep normal Btrfs mounts with CoW and checksums, but get `btrfs property set ... compression no` before data is copied. This avoids relying on per-subvolume `compress`/`nodatacow` fstab options, which Btrfs does not support reliably for mounts of the same filesystem. Image layers and metadata in `@docker`/`@containers` themselves stay on the normal compressed policy.
 
@@ -109,12 +115,9 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - Comments old Btrfs root lines as `#OLD-ROOT ...`.
   - Appends new Btrfs entries for `/`, `/home`, `/var/log`, `/var/lib/docker`, etc., pointing to the corresponding subvolumes.
 
-- Adjusts GRUB (if present):
+- Moves a swap file that lives on this Btrfs (first run or `--finish-migration` only): the file is not copied into `@` (a copied swap file is CoW and `swapon` would fail). Instead a subvolume `@swap` is created (no CoW), mounted at `/swap`, a fresh `/swap/swapfile` of the same size is created there and `/etc/fstab` is updated (old line kept as `#OLD-SWAP ...`).
+- Rewrites the boot configuration inside the new root (`@`), via chroot with `/dev`, `/proc`, `/sys`, `/run`, `/boot/efi` bound: `grub-install` (EFI, or BIOS on the root disk) and `update-grub`. GRUB resolves paths on Btrfs relative to the **top level** (`subvolid=5`), **not** to the subvolume set with `btrfs subvolume set-default`. The script therefore keeps (or restores) the top level as default subvolume, so that `grub-mkconfig` and `grub-install` produce `/@/boot/...` paths and `rootflags=subvol=@`. Earlier versions of this script set `@` as the default subvolume; GRUB then kept reading a stale `/boot` copy in the top level and never started new kernels. The result is verified (kernel entries present, `rootflags=subvol=@`, `grub.cfg` on the ESP points to `/@/boot/grub`, no reference to the old root subvolume); on failure the default subvolume is restored and the script aborts.
 
-  - Replaces `@rootfs` with `@` in `/etc/default/grub` if needed.
-  - Runs `update-grub` or `grub-mkconfig -o /boot/grub/grub.cfg` if available.
-
-- Sets the Btrfs default subvolume to `@`, so the system boots from `@`.
 - Ensures required mountpoints also exist in the current root (`/home`, `/var/lib/docker`, …).
 - Validates the new `/etc/fstab` automatically with `findmnt --verify` (read-only, doesn't remount anything live) and aborts before you accidentally reboot into a broken fstab.
 
@@ -203,6 +206,24 @@ In an interactive run, the script can also offer optional APT packages (`timeshi
    - `/home` from `...[/@home]`, etc.
 
 At this point, Timeshift can use `@` as the root subvolume and your layout is ready for snapshots and container workloads.
+
+### Options
+
+| Option | Effect |
+|---|---|
+| *(none)* | First migration (root to `@`) or, if `/` already runs from `@`, incremental addition of missing subvolumes. |
+| `--finish-migration` | Completes a half-migrated system whose `/` still runs from another subvolume (for example `@rootfs`): `@` is refilled from the running root and the boot configuration (GRUB) is rewritten in the new root; the top level stays the default subvolume. A reboot is required afterwards. |
+| `--cleanup-old-root` | After a successful reboot from `@`: deletes the old root (`@rootfs` and/or the root directories in the Btrfs top level). Refuses to run unless `/` runs from `@`; shows what will be deleted and asks for `ja` (or use `--yes`). `@…` subvolumes and `timeshift-btrfs` are never touched. |
+| `--fix-boot` | For a system whose `/` already runs from `@` but whose GRUB still reads a stale `/boot` copy in the top level (symptom: `/proc/cmdline` shows `BOOT_IMAGE=/boot/vmlinuz-…` without `rootflags=subvol=@`, and an older kernel than the newest installed one runs). Rewrites GRUB, restores the top level as default subvolume and saves the old configuration to `/root/btrfs-layout-boot-backup-<time>`. Reboot afterwards. |
+| `--subvols LIST` | Comma-separated subvolume names (for example `@root,@home,@microk8s`) instead of the dialog or the default selection. |
+| `--yes`, `-y` | Answers the "backup exists?" question automatically. |
+
+Non-interactive example for a Kubernetes node: `sudo ./setup-btrfs.sh --yes --subvols @root,@home,@log,@cache,@tmp,@tmp_var,@microk8s,@k8s-storage`.
+
+### Tests
+
+- `tests/test-mode-detection.sh` checks mode detection and argument handling without root.
+- `tests/vm/` builds two UEFI test machines with QEMU/KVM (no root on the host): scenario `a` (Ubuntu, Btrfs root in the top level, swap file) and scenario `b` (Debian, root in `@rootfs`, `fstab` already pointing to `@`). `tests/vm/run-scenario.sh a|b` runs the script, reboots three times (including `update-grub` in the new system) and finally `--cleanup-old-root`. See `tests/vm/vm.sh` for the helper commands.
 
 ## setup-timeshift.sh
 

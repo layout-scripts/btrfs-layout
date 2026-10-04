@@ -68,6 +68,9 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
   - `@docker-volumes`
   - `@containers-volumes`
   - `@www`
+  - `@journal-remote`
+  - `@microk8s`
+  - `@k8s-storage`
 
 - Kopiert das aktuelle Root-Dateisystem nach `@` (mit Ausschlüssen für `/dev`, `/proc`, `/sys`, `/run`, `/mnt`, `/media`, `/lost+found` sowie – automatisch aus dem Mapping unten abgeleitet – allen Pfaden, die ein eigenes Subvolume bekommen).
 - Kopiert die Inhalte wichtiger Verzeichnisse in ihre Subvolumes:
@@ -99,6 +102,9 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
   - `/var/lib/docker/volumes` → `@docker-volumes`
   - `/var/lib/containers/storage/volumes` → `@containers-volumes`
   - `/var/www` → `@www`
+  - `/var/log/journal/remote` → `@journal-remote`
+  - `/var/snap/microk8s/common` → `@microk8s`
+  - `/var/lib/k8s-storage` → `@k8s-storage`
 
   Datenbank- und Datastore-Subvolumes (`@mongodb`, `@mysql`, `@postgresql`, `@chroma`, `@clamav`, `@stalwart`, `@elasticsearch`, `@opensearch`, `@clickhouse`, `@cassandra`, `@couchdb`, `@neo4j`, `@rabbitmq`) sowie die benannten Docker-/Podman-Volumes (`@docker-volumes`, `@containers-volumes`) behalten normale Btrfs-Mounts mit CoW und Prüfsummen, bekommen aber vor der Datenkopie `btrfs property set ... compression no`. Damit verlässt sich das Skript nicht auf per-Subvolume gesetzte `compress`-/`nodatacow`-fstab-Optionen, die Btrfs für Mounts desselben Dateisystems nicht zuverlässig getrennt unterstützt. Image-Layer und Metadaten in `@docker`/`@containers` selbst bleiben auf der normalen komprimierten Policy.
 
@@ -109,12 +115,9 @@ Auf einem Debian- (oder Debian-basierten) System mit Btrfs-Root führt das Skrip
   - kommentiert alte Btrfs-Root-Zeilen als `#OLD-ROOT …` aus,
   - fügt neue Btrfs-Einträge für `/`, `/home`, `/var/log`, `/var/lib/docker`, `/var/www` usw. mit den entsprechenden `@…`-Subvolumes hinzu.
 
-- Passt GRUB an (falls vorhanden):
+- Verschiebt eine Swap-Datei, die auf diesem Btrfs liegt (nur Erstlauf oder `--finish-migration`): Die Datei wird nicht nach `@` kopiert (eine kopierte Swap-Datei ist CoW, `swapon` würde scheitern). Stattdessen entsteht das Subvolume `@swap` (ohne CoW), eingehängt unter `/swap`, dort wird eine neue `/swap/swapfile` gleicher Größe angelegt und `/etc/fstab` angepasst (alte Zeile bleibt als `#OLD-SWAP ...` erhalten).
+- Schreibt die Bootkonfiguration im neuen Root (`@`) neu, per chroot mit gebundenen `/dev`, `/proc`, `/sys`, `/run`, `/boot/efi`: `grub-install` (EFI, bzw. BIOS auf der Root-Platte) und `update-grub`. GRUB löst Pfade auf Btrfs relativ zum **Top-Level** (`subvolid=5`) auf, **nicht** relativ zu dem mit `btrfs subvolume set-default` gesetzten Subvolume. Das Skript belässt (oder setzt) deshalb den Top-Level als Default-Subvolume, damit `grub-mkconfig` und `grub-install` Pfade der Form `/@/boot/...` und `rootflags=subvol=@` erzeugen. Ältere Versionen dieses Skripts setzten `@` als Default-Subvolume; GRUB las danach weiter eine veraltete `/boot`-Kopie im Top-Level und startete neue Kernel nie. Das Ergebnis wird geprüft (Kerneleinträge vorhanden, `rootflags=subvol=@`, `grub.cfg` auf der ESP zeigt auf `/@/boot/grub`, kein Verweis auf das alte Root-Subvolume); bei einem Fehler wird das Default-Subvolume zurückgesetzt und das Skript bricht ab.
 
-  - ersetzt ggf. `@rootfs` durch `@` in `/etc/default/grub`,
-  - ruft `update-grub` oder `grub-mkconfig -o /boot/grub/grub.cfg` auf (sofern vorhanden).
-
-- Setzt das Btrfs-Default-Subvolume auf `@`, sodass das System von `@` bootet.
 - Stellt sicher, dass die benötigten Mountpoints auch im aktuellen Root existieren (`/home`, `/var/lib/docker`, …).
 - Validiert die neue `/etc/fstab` automatisch mit `findmnt --verify` (rein lesend, mountet nichts live um) und bricht bei Problemen ab, bevor du versehentlich mit einer kaputten fstab neu startest.
 
@@ -204,6 +207,24 @@ In einem interaktiven Lauf kann das Skript außerdem optionale APT-Pakete (`time
    - `/home` von `...[/@home]` usw.
 
 Damit ist das Layout für Timeshift und Container-Workloads vorbereitet.
+
+### Optionen
+
+| Option | Wirkung |
+|---|---|
+| *(keine)* | Erstmigration (Root nach `@`) oder, wenn `/` schon von `@` läuft, inkrementelles Ergänzen fehlender Subvolumes. |
+| `--finish-migration` | Schließt ein halb migriertes System ab, dessen `/` noch von einem anderen Subvolume läuft (zum Beispiel `@rootfs`): `@` wird aus dem laufenden Root neu befüllt und die Bootkonfiguration (GRUB) im neuen Root neu geschrieben; der Top-Level bleibt Default-Subvolume. Danach ist ein Reboot nötig. |
+| `--cleanup-old-root` | Nach erfolgreichem Reboot von `@`: löscht den alten Root (`@rootfs` und/oder die Root-Verzeichnisse im Btrfs-Top-Level). Läuft nur, wenn `/` von `@` kommt; zeigt, was gelöscht wird, und fragt nach `ja` (oder `--yes`). `@…`-Subvolumes und `timeshift-btrfs` bleiben unberührt. |
+| `--fix-boot` | Für ein System, dessen `/` schon von `@` läuft, dessen GRUB aber noch eine veraltete `/boot`-Kopie im Top-Level liest (Symptom: `/proc/cmdline` zeigt `BOOT_IMAGE=/boot/vmlinuz-…` ohne `rootflags=subvol=@`, und es läuft ein älterer Kernel als der neueste installierte). Schreibt GRUB neu, setzt den Top-Level als Default-Subvolume zurück und sichert die alte Konfiguration nach `/root/btrfs-layout-boot-backup-<Zeit>`. Danach Reboot. |
+| `--subvols LISTE` | Kommagetrennte Subvolume-Namen (zum Beispiel `@root,@home,@microk8s`) statt Dialog oder Standardauswahl. |
+| `--yes`, `-y` | Beantwortet die Frage „Backup vorhanden?“ automatisch. |
+
+Nicht interaktives Beispiel für einen Kubernetes-Node: `sudo ./setup-btrfs.sh --yes --subvols @root,@home,@log,@cache,@tmp,@tmp_var,@microk8s,@k8s-storage`.
+
+### Tests
+
+- `tests/test-mode-detection.sh` prüft Moduserkennung und Argumentbehandlung ohne Root.
+- `tests/vm/` baut mit QEMU/KVM zwei UEFI-Testmaschinen (ohne Root auf dem Host): Szenario `a` (Ubuntu, Btrfs-Root im Top-Level, Swap-Datei) und Szenario `b` (Debian, Root in `@rootfs`, `fstab` zeigt schon auf `@`). `tests/vm/run-scenario.sh a|b` führt das Skript aus, startet dreimal neu (inklusive `update-grub` im neuen System) und zuletzt `--cleanup-old-root`. Hilfsbefehle stehen in `tests/vm/vm.sh`.
 
 ## setup-timeshift.sh
 

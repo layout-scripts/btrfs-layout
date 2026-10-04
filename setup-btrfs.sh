@@ -1,6 +1,75 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+Verwendung: setup-btrfs.sh [Optionen]
+
+  (ohne Option)          Erstmigration (Root nach @) oder, wenn / schon von @ läuft,
+                         inkrementelles Ergänzen fehlender Subvolumes.
+  --finish-migration     Halb migrierte Systeme abschließen: / läuft noch von einem anderen
+                         Subvolume (z. B. @rootfs), @ wird neu befüllt, GRUB im neuen Root
+                         neu erzeugt. Danach Reboot nötig.
+  --cleanup-old-root     Nach erfolgreichem Reboot von @: Altdaten des alten Roots entfernen
+                         (@rootfs bzw. die Root-Dateien im Top-Level). Löscht Daten.
+  --fix-boot             Läuft / von @ und bootet GRUB trotzdem eine veraltete /boot-Kopie im
+                         Top-Level (Kernel wird nie aktualisiert)? Schreibt GRUB neu und setzt das
+                         Default-Subvolume auf den Top-Level zurück. Danach Reboot.
+  --subvols LISTE        Kommagetrennte Subvolume-Namen (z. B. @root,@home,@microk8s) statt
+                         Auswahldialog bzw. Standardauswahl.
+  --yes, -y              Rückfrage "Backup vorhanden?" automatisch bejahen.
+  -h, --help             Diese Hilfe.
+USAGE
+}
+
+# Aus "/dev/vda2[/@rootfs]" den Subvolume-Pfad ("/@rootfs") ermitteln; leer, wenn Top-Level.
+root_subvol_of() {
+  local src="$1"
+  [[ "$src" == *"["* ]] || { echo ""; return 0; }
+  src="${src#*[}"
+  echo "${src%]}"
+}
+
+# detect_mode ROOT_SRC FINISH(0|1) -> initial | incremental | finish | done
+detect_mode() {
+  local sub
+  sub=$(root_subvol_of "$1")
+  if [[ -z "$sub" ]]; then
+    echo initial
+  elif [[ "$2" == 1 ]]; then
+    if [[ "$sub" == "/@" ]]; then echo "done"; else echo "finish"; fi
+  else
+    echo incremental
+  fi
+}
+
+# Zum Testen der Funktionen oben per "source" ohne Nebenwirkungen laden.
+if [[ "${SETUP_BTRFS_SOURCE_ONLY:-}" == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+MODE_FINISH=0
+MODE_CLEANUP=0
+MODE_FIXBOOT=0
+ASSUME_YES=0
+SUBVOLS_ARG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --finish-migration) MODE_FINISH=1 ;;
+    --cleanup-old-root) MODE_CLEANUP=1 ;;
+    --fix-boot) MODE_FIXBOOT=1 ;;
+    --subvols) SUBVOLS_ARG="${2:?--subvols braucht eine Liste}"; shift ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+if (( MODE_FINISH + MODE_CLEANUP + MODE_FIXBOOT > 1 )); then
+  echo "--finish-migration, --cleanup-old-root und --fix-boot schließen sich gegenseitig aus." >&2
+  exit 2
+fi
+
 echo ">>> Btrfs-Setup: Root auf @ + alle Subvolumes/Mounts (final)"
 
 if [[ $EUID -ne 0 ]]; then
@@ -50,13 +119,314 @@ fi
 # und das Default-Subvolume bleiben dann unangetastet; es werden nur noch
 # fehlende Subvolumes fuer noch nicht separat gemountete Pfade ergaenzt - ohne
 # Neustart, da kein Root-Wechsel mehr noetig ist.
-INCREMENTAL=0
-if [[ "$ROOT_SRC" == *"["* ]]; then
-  INCREMENTAL=1
-  echo ">>> / läuft bereits von einem benannten Subvolume (${ROOT_SRC})."
-  echo ">>> Inkrementeller Modus: nur fehlende Subvolumes werden ergänzt."
-  echo ">>> Root, GRUB und Default-Subvolume bleiben unangetastet, kein Neustart nötig."
+# --- Altdaten nach erfolgreichem Wechsel auf @ entfernen (--cleanup-old-root) ---
+cleanup_old_root() {
+  local mnt=/mnt/btrfs-root x name size confirm
+  local -a subs=() cands=() nested=()
+  local old_root_names=(bin boot dev etc home lib lib32 lib64 libx32 lost+found media mnt opt proc root run
+                        sbin srv sys tmp usr var snap swap.img bin.usr-is-merged lib.usr-is-merged sbin.usr-is-merged)
+
+  if [[ "$(root_subvol_of "$ROOT_SRC")" != "/@" ]]; then
+    echo "FEHLER: / läuft nicht von @ (${ROOT_SRC}). Aufräumen abgelehnt, solange der alte Root noch gebraucht wird." >&2
+    exit 1
+  fi
+  if mount | grep -q " on $mnt "; then
+    echo "$mnt ist bereits gemountet, bitte zuerst aushängen." >&2
+    exit 1
+  fi
+  mkdir -p "$mnt"
+  mount -o subvolid=5 "$ROOT_DEV" "$mnt"
+  trap 'umount "$mnt" 2>/dev/null || true' RETURN
+
+  if [[ ! -d "$mnt/@/etc" || ! -d "$mnt/@/usr" ]]; then
+    echo "FEHLER: @ enthält kein vollständiges System (etc/usr fehlen). Abbruch." >&2
+    return 1
+  fi
+
+  mapfile -t subs < <(btrfs subvolume list "$mnt" | awk '{print $NF}')
+  is_subvol() { local y; for y in "${subs[@]}"; do [[ "$y" == "$1" ]] && return 0; done; return 1; }
+
+  is_subvol "@rootfs" && cands+=("@rootfs")
+  for name in "${old_root_names[@]}"; do
+    [[ -e "$mnt/$name" || -L "$mnt/$name" ]] || continue
+    is_subvol "$name" && continue
+    cands+=("$name")
+  done
+
+  if [[ ${#cands[@]} -eq 0 ]]; then
+    echo ">>> Keine Altdaten des alten Roots gefunden - nichts zu tun."
+    return 0
+  fi
+
+  echo ">>> Folgende Altdaten im Top-Level werden GELÖSCHT (@, @home, timeshift-btrfs usw. bleiben):"
+  for name in "${cands[@]}"; do
+    size=$(du -shx "$mnt/$name" 2>/dev/null | awk '{print $1}')
+    echo "    $name  (${size:-?})"
+  done
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    echo ">>> --yes angegeben - Bestätigung übersprungen."
+  elif [[ -t 0 ]]; then
+    read -r -p "Wirklich löschen? Zum Fortfahren exakt 'ja' eingeben: " confirm
+    [[ "$confirm" == "ja" ]] || { echo "Abgebrochen." >&2; return 1; }
+  else
+    echo "FEHLER: Kein Terminal und kein --yes - Löschen abgelehnt." >&2
+    return 1
+  fi
+
+  for name in "${cands[@]}"; do
+    # verschachtelte Subvolumes (z. B. Docker-btrfs-Driver) zuerst, tiefste zuerst
+    mapfile -t nested < <(printf '%s\n' "${subs[@]}" | grep -E "^${name//./\\.}/" | sort -r || true)
+    for x in "${nested[@]}"; do
+      [[ -n "$x" ]] || continue
+      echo ">>> Lösche Subvolume $x"
+      btrfs subvolume delete "$mnt/$x" >/dev/null
+    done
+    if is_subvol "$name"; then
+      echo ">>> Lösche Subvolume $name"
+      btrfs subvolume delete "$mnt/$name" >/dev/null
+    else
+      echo ">>> Lösche $name"
+      rm -rf --one-file-system "${mnt:?}/$name"
+    fi
+  done
+  echo ">>> Aufräumen abgeschlossen."
+  df -h / | tail -1
+}
+
+# --- Bootkonfiguration (GRUB) -------------------------------------------------------------
+# GRUB loest Pfade auf Btrfs relativ zum TOP-LEVEL (subvolid=5) auf, NICHT relativ zum mit
+# "btrfs subvolume set-default" gesetzten Default-Subvolume (im QEMU-Test geprueft: in der
+# GRUB-Shell zeigt "ls (hd0,gpt2)/" @, @home, ...). Daraus folgt:
+#   - Das Default-Subvolume muss der Top-Level bleiben (ID 5). Nur dann erzeugen
+#     grub-mkconfig und grub-install Pfade der Form /@/boot/... und "rootflags=subvol=@".
+#     Aeltere Versionen dieses Skripts setzten @ als Default; GRUB las danach weiter die
+#     veraltete /boot-Kopie im Top-Level und startete neue Kernel nie (node6: Kernel 7.0.0-27
+#     trotz installiertem 7.0.0-34).
+#   - GRUB selbst (Image/grub.cfg auf der ESP bzw. core.img im MBR-Gap) muss per
+#     grub-install neu geschrieben werden, damit der Praefix /@/boot/grub lautet.
+#   - grub.cfg muss im neuen Root (@) erzeugt werden.
+BOOT_ROOT=""          # leer = laufendes System, sonst chroot-Verzeichnis
+DEFAULT_CHANGED=0
+OLD_DEFAULT_ID=""
+
+boot_run() {
+  if [[ -n "$BOOT_ROOT" ]]; then chroot "$BOOT_ROOT" "$@"; else "$@"; fi
+}
+
+ensure_toplevel_default() {
+  OLD_DEFAULT_ID=$(btrfs subvolume get-default "$MNT" 2>/dev/null | awk '{print $2}')
+  if [[ -n "$OLD_DEFAULT_ID" && "$OLD_DEFAULT_ID" != "5" ]]; then
+    echo ">>> Default-Subvolume ist ID ${OLD_DEFAULT_ID}, nicht der Top-Level (5). Wird zurückgesetzt, weil GRUB"
+    echo ">>> Pfade relativ zum Top-Level auflöst (siehe Kommentar im Skript)."
+    btrfs subvolume set-default 5 "$MNT"
+    DEFAULT_CHANGED=1
+  fi
+}
+
+restore_default_subvolume() {
+  if [[ $DEFAULT_CHANGED -eq 1 && -n "$OLD_DEFAULT_ID" ]]; then
+    echo ">>> Setze Default-Subvolume zurück auf ID $OLD_DEFAULT_ID." >&2
+    btrfs subvolume set-default "$OLD_DEFAULT_ID" "$MNT" || true
+    DEFAULT_CHANGED=0
+  fi
+}
+
+# Fallback-Loader (EFI/BOOT) aktualisieren, falls vorhanden: Signierte Setups (shim) bekommen
+# die Dateien aus dem Distributionsverzeichnis, Standalone-Images werden kopiert.
+refresh_fallback_loader() {
+  local esp="$1" arch up id d name
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;;
+    aarch64) arch=aa64 ;;
+    *) return 0 ;;
+  esac
+  up="${arch^^}"
+  [[ -f "$esp/EFI/BOOT/BOOT${up}.EFI" ]] || return 0
+  # Standard-Fallback von Ubuntu/Debian (shim + fbx64.efi): Der Fallback-Loader startet ueber
+  # BOOT*.CSV den Eintrag aus EFI/<id>/ und enthaelt selbst kein GRUB - nichts zu aktualisieren.
+  [[ -f "$esp/EFI/BOOT/fb${arch}.efi" ]] && return 0
+  id=""
+  for d in "$esp"/EFI/*/; do
+    name=$(basename "$d")
+    [[ "$name" == BOOT ]] && continue
+    [[ -f "$d/grub${arch}.efi" ]] || continue
+    id="$name"
+    break
+  done
+  if [[ -z "$id" ]]; then
+    echo "WARNUNG: Kein GRUB-Verzeichnis auf der ESP gefunden - Fallback-Loader EFI/BOOT nicht aktualisiert." >&2
+    return 0
+  fi
+  echo ">>> Aktualisiere Fallback-Loader EFI/BOOT aus EFI/$id"
+  if [[ -f "$esp/EFI/$id/shim${arch}.efi" ]]; then
+    cp "$esp/EFI/$id/shim${arch}.efi" "$esp/EFI/BOOT/BOOT${up}.EFI"
+    cp "$esp/EFI/$id/grub${arch}.efi" "$esp/EFI/BOOT/"
+    [[ -f "$esp/EFI/$id/mm${arch}.efi" ]] && cp "$esp/EFI/$id/mm${arch}.efi" "$esp/EFI/BOOT/"
+  else
+    cp "$esp/EFI/$id/grub${arch}.efi" "$esp/EFI/BOOT/BOOT${up}.EFI"
+  fi
+}
+
+write_boot_files() {
+  local esp="${BOOT_ROOT}/boot/efi" disk
+  if [[ -d /sys/firmware/efi ]]; then
+    if mountpoint -q "$esp"; then
+      echo ">>> grub-install (EFI) im Zielsystem"
+      boot_run grub-install --no-nvram || return 1
+      refresh_fallback_loader "$esp"
+    else
+      echo "FEHLER: /boot/efi ist nicht gemountet - GRUB (EFI) kann nicht aktualisiert werden." >&2
+      return 1
+    fi
+  else
+    disk=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null | head -1)
+    if [[ -z "$disk" ]]; then
+      echo "FEHLER: Konnte die Platte von $ROOT_DEV für grub-install (BIOS) nicht ermitteln." >&2
+      return 1
+    fi
+    echo ">>> grub-install (BIOS) auf /dev/$disk"
+    boot_run grub-install "/dev/$disk" || return 1
+  fi
+  echo ">>> GRUB-Konfiguration erzeugen"
+  boot_run /bin/sh -c '
+    if command -v update-grub >/dev/null 2>&1; then update-grub
+    elif command -v grub-mkconfig >/dev/null 2>&1; then grub-mkconfig -o /boot/grub/grub.cfg
+    else echo "Weder update-grub noch grub-mkconfig gefunden" >&2; exit 3; fi'
+}
+
+verify_boot_config() {
+  local cfg="${BOOT_ROOT}/boot/grub/grub.cfg" esp="${BOOT_ROOT}/boot/efi" f ok=1
+  if [[ ! -s "$cfg" ]] || ! grep -Eq '^[[:space:]]*linux[[:space:]]' "$cfg"; then
+    echo "FEHLER: Erzeugte grub.cfg enthält keine Kernel-Einträge ($cfg)." >&2
+    return 1
+  fi
+  if ! grep -Eq 'rootflags=subvol=@([[:space:]]|$)' "$cfg"; then
+    echo "FEHLER: grub.cfg enthält kein rootflags=subvol=@ - das System würde nicht von @ starten." >&2
+    ok=0
+  fi
+  if [[ -n "${ROOT_SUBVOL:-}" && "$ROOT_SUBVOL" != "/@" ]] && grep -Fq "${ROOT_SUBVOL#/}" "$cfg"; then
+    echo "FEHLER: grub.cfg verweist noch auf das alte Root-Subvolume ${ROOT_SUBVOL}." >&2
+    ok=0
+  fi
+  for f in "$esp"/EFI/*/grub.cfg; do
+    [[ -f "$f" ]] || continue
+    if grep -q 'set prefix=' "$f" && ! grep -Eq "set prefix=.*/@/boot/grub" "$f"; then
+      echo "FEHLER: $f verweist nicht auf /@/boot/grub (GRUB würde die alte Konfiguration lesen)." >&2
+      ok=0
+    fi
+  done
+  [[ $ok -eq 1 ]]
+}
+
+# Erstmigration/--finish-migration: Bootkonfiguration im frisch befuellten @ erzeugen.
+regenerate_boot_in_new_root() {
+  local newroot=/mnt/btrfs-newroot d ok=1
+  ensure_toplevel_default
+  echo ">>> Bootkonfiguration im neuen Root (@) erzeugen"
+  mkdir -p "$newroot"
+  mount -o subvol=@ "$ROOT_DEV" "$newroot"
+  for d in dev proc sys run; do
+    mount --rbind "/$d" "$newroot/$d"
+    mount --make-rslave "$newroot/$d"
+  done
+  if mountpoint -q /boot; then mount --bind /boot "$newroot/boot"; fi
+  if mountpoint -q /boot/efi; then
+    mkdir -p "$newroot/boot/efi"
+    mount --bind /boot/efi "$newroot/boot/efi"
+  fi
+  if [[ -f "$newroot/etc/default/grub" ]]; then
+    sed -i 's/@rootfs/@/g' "$newroot/etc/default/grub"
+  fi
+  BOOT_ROOT="$newroot"
+  write_boot_files || ok=0
+  if [[ $ok -eq 1 ]]; then verify_boot_config || ok=0; fi
+  BOOT_ROOT=""
+  umount -R -l "$newroot" || true
+  if [[ $ok -ne 1 ]]; then
+    echo "FEHLER: Bootkonfiguration im neuen Root fehlgeschlagen." >&2
+    restore_default_subvolume
+    restart_stopped_services
+    umount "$MNT" || true
+    exit 1
+  fi
+}
+
+# --fix-boot: Bootkonfiguration des laufenden @-Systems reparieren (z. B. node6 nach der
+# alten Skriptversion: Default-Subvolume @, GRUB liest veraltete /boot-Kopie im Top-Level).
+fix_boot() {
+  local confirm
+  ROOT_SUBVOL=$(root_subvol_of "$ROOT_SRC")
+  if [[ "$ROOT_SUBVOL" != "/@" ]]; then
+    echo "FEHLER: --fix-boot erwartet, dass / von @ läuft (ist: ${ROOT_SRC})." >&2
+    exit 1
+  fi
+  echo ">>> --fix-boot: GRUB wird neu geschrieben (grub-install, update-grub) und das Default-Subvolume"
+  echo ">>> bei Bedarf auf den Top-Level zurückgesetzt. Ein Fehler kann das System unbootbar machen;"
+  echo ">>> die Konfiguration wird vorher in /root/btrfs-layout-boot-backup-<Zeit> gesichert."
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    echo ">>> --yes angegeben - Bestätigung übersprungen."
+  elif [[ -t 0 ]]; then
+    read -r -p "Fortfahren? Exakt 'ja' eingeben: " confirm
+    [[ "$confirm" == "ja" ]] || { echo "Abgebrochen." >&2; exit 1; }
+  fi
+  local bk
+  bk="/root/btrfs-layout-boot-backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bk"
+  cp -a /boot/grub "$bk/" 2>/dev/null || true
+  cp -a /boot/efi/EFI "$bk/EFI" 2>/dev/null || true
+  btrfs subvolume get-default / > "$bk/default-subvolume.txt" 2>/dev/null || true
+  MNT=/mnt/btrfs-root
+  mkdir -p "$MNT"
+  mount -o subvolid=5 "$ROOT_DEV" "$MNT"
+  # shellcheck disable=SC2064
+  trap "umount '$MNT' 2>/dev/null || true" EXIT
+  ensure_toplevel_default
+  BOOT_ROOT=""
+  if ! write_boot_files || ! verify_boot_config; then
+    echo "FEHLER: Bootkonfiguration konnte nicht erzeugt werden. Sicherung: $bk" >&2
+    restore_default_subvolume
+    umount "$MNT" || true
+    exit 1
+  fi
+  umount "$MNT" || true
+  echo ">>> Bootkonfiguration repariert. Sicherung: $bk"
+  echo ">>> Jetzt neu starten und prüfen: /proc/cmdline soll BOOT_IMAGE=/@/boot/... und rootflags=subvol=@ zeigen."
+}
+
+if [[ $MODE_CLEANUP -eq 1 ]]; then
+  cleanup_old_root
+  exit $?
 fi
+
+if [[ $MODE_FIXBOOT -eq 1 ]]; then
+  fix_boot
+  exit $?
+fi
+
+ROOT_SUBVOL=$(root_subvol_of "$ROOT_SRC")
+MODE=$(detect_mode "$ROOT_SRC" "$MODE_FINISH")
+INCREMENTAL=0
+case "$MODE" in
+  done)
+    echo ">>> / läuft bereits von @ - die Migration ist abgeschlossen, nichts zu tun."
+    echo ">>> Alte Root-Daten entfernen: setup-btrfs.sh --cleanup-old-root"
+    exit 0
+    ;;
+  finish)
+    echo ">>> / läuft von ${ROOT_SUBVOL}, nicht von @. Migration wird abgeschlossen (--finish-migration):"
+    echo ">>> @ wird aus dem laufenden Root neu befüllt, GRUB im neuen Root neu erzeugt."
+    ;;
+  incremental)
+    INCREMENTAL=1
+    echo ">>> / läuft bereits von einem benannten Subvolume (${ROOT_SRC})."
+    echo ">>> Inkrementeller Modus: nur fehlende Subvolumes werden ergänzt."
+    echo ">>> Root, GRUB und Default-Subvolume bleiben unangetastet, kein Neustart nötig."
+    if [[ "$ROOT_SUBVOL" != "/@" ]]; then
+      echo "WARNUNG: / läuft von ${ROOT_SUBVOL} und nicht von @. Ist die Migration unvollständig?" >&2
+      echo "         Dann mit --finish-migration abschließen." >&2
+    fi
+    ;;
+esac
 
 # --- Ausdrückliche Bestätigung, bevor irgendetwas verändert wird ---
 echo
@@ -75,7 +445,9 @@ else
   echo "zurückgespielt)."
 fi
 echo
-if [[ -t 0 ]]; then
+if [[ $ASSUME_YES -eq 1 ]]; then
+  echo ">>> --yes angegeben - Bestätigung übersprungen."
+elif [[ -t 0 ]]; then
   read -r -p "Backup vorhanden? Zum Fortfahren exakt 'ja' eingeben: " CONFIRM
   if [[ "$CONFIRM" != "ja" ]]; then
     echo "Abgebrochen." >&2
@@ -178,6 +550,9 @@ declare -a ALL_MAPS=(
 "/tmp:@tmp"
 "/opt:@opt"
 "/var/www:@www"
+# Zentrale Journal-Sammelstelle (systemd-journal-remote). Liegt innerhalb von @log;
+# eigenes Subvolume erlaubt gezielte Snapshots und Rechte, getrennt vom lokalen Journal.
+"/var/log/journal/remote:@journal-remote"
 # Container-Engines und ihre benannten Volumes. Volume-Subvolumes stehen
 # direkt hinter ihrem Eltern-Subvolume (Zugehoerigkeit im Dialog erkennbar)
 # und sind getrennt von @docker/@containers, damit Volume-Daten gezielt von
@@ -187,6 +562,9 @@ declare -a ALL_MAPS=(
 "/var/lib/containers/storage/volumes:@containers-volumes"
 "/var/lib/docker:@docker"
 "/var/lib/docker/volumes:@docker-volumes"
+# Kubernetes (MicroK8s-Snap): Laufzeitdaten samt Datastore und lokale PersistentVolumes.
+"/var/snap/microk8s/common:@microk8s"
+"/var/lib/k8s-storage:@k8s-storage"
 # Datenbank-/Datastore-Pfade: stark vom konkreten Software-Stack abhaengig,
 # deshalb im Auswahldialog ganz unten.
 "/var/lib/mongodb:@mongodb"
@@ -236,6 +614,9 @@ declare -A SUBVOL_OPTS=(
   [@rabbitmq]="noatime,compress=zstd,space_cache=v2"
   [@docker-volumes]="noatime,compress=zstd,space_cache=v2"
   [@containers-volumes]="noatime,compress=zstd,space_cache=v2"
+  [@journal-remote]="noatime,compress=zstd,space_cache=v2"
+  [@microk8s]="noatime,compress=zstd,space_cache=v2"
+  [@k8s-storage]="noatime,compress=zstd,space_cache=v2"
 )
 
 # Diese Subvolumes behalten CoW und Checksums, werden aber per
@@ -257,6 +638,9 @@ declare -A NO_COMPRESSION_SUBVOLS=(
   [@rabbitmq]=1
   [@docker-volumes]=1
   [@containers-volumes]=1
+  [@journal-remote]=1
+  [@microk8s]=1
+  [@k8s-storage]=1
 )
 
 # Volume-Subvolumes liegen INNERHALB ihres Eltern-Subvolumes und brauchen es
@@ -302,7 +686,7 @@ if [[ ${#CONFLICTS[@]} -gt 0 ]]; then
     echo "    $c" >&2
   done
 fi
-if [[ ${#MAPS[@]} -eq 0 ]]; then
+if [[ ${#MAPS[@]} -eq 0 && $INCREMENTAL -eq 1 ]]; then
   echo ">>> Nichts zu tun - alle Subvolumes sind bereits eingerichtet oder anderweitig belegt."
   umount "$MNT"
   exit 0
@@ -348,23 +732,8 @@ for entry in "${MAPS[@]}"; do
   echo "    $sub ($(checklist_desc_for "$src" "$sub"))"
 done
 
-if [[ -t 0 && -t 1 ]]; then
-  need_pkg whiptail whiptail
-  CHECKLIST_ARGS=()
-  for entry in "${MAPS[@]}"; do
-    src="${entry%%:*}"
-    sub="${entry##*:}"
-    state="OFF"
-    [[ -n "${DEFAULT_ON[$sub]:-}" ]] && state="ON"
-    CHECKLIST_ARGS+=("$sub" "$(checklist_desc_for "$src" "$sub")" "$state")
-  done
-  SELECTED=$(whiptail --title "Btrfs-Subvolumes auswählen" \
-    --checklist "Universell sinnvolle Subvolumes sind vorausgewählt. Einträge mit 'no-compress' behalten CoW/Prüfsummen, bekommen aber per Btrfs-Property compression=no vor der Datenkopie. Volume-Subvolumes (*-volumes) aktivieren automatisch ihr Eltern-Subvolume. Leertaste = ab-/anwählen, Enter = bestätigen.\nAbgewählte Pfade bleiben einfach Teil von @ (Root)." \
-    24 78 14 \
-    "${CHECKLIST_ARGS[@]}" \
-    3>&1 1>&2 2>&3) || { echo "Abgebrochen." >&2; umount "$MNT"; exit 1; }
-  eval "SELECTED_ARR=($SELECTED)"
-
+# Wendet SELECTED_ARR auf MAPS an (inkl. automatischer Eltern-Subvolumes).
+apply_selection() {
   # Volume-Subvolumes brauchen ihr Eltern-Subvolume (siehe VOLUME_PARENT
   # oben); wird nur das Volume gewaehlt, muss das Elternteil automatisch
   # ergaenzt werden - sonst legt prepare_mp spaeter verwaiste Verzeichnisse
@@ -401,6 +770,40 @@ if [[ -t 0 && -t 1 ]]; then
   done
   MAPS=("${FILTERED_MAPS[@]}")
   echo ">>> Ausgewählt: ${#MAPS[@]} Subvolumes."
+}
+
+if [[ -n "$SUBVOLS_ARG" ]]; then
+  IFS=',' read -r -a SELECTED_ARR <<< "$SUBVOLS_ARG"
+  for sel in "${SELECTED_ARR[@]}"; do
+    known=0
+    for entry in "${ALL_MAPS[@]}"; do
+      [[ "${entry##*:}" == "$sel" ]] && { known=1; break; }
+    done
+    if [[ $known -eq 0 ]]; then
+      echo "FEHLER: Unbekanntes Subvolume in --subvols: $sel" >&2
+      umount "$MNT"
+      exit 2
+    fi
+  done
+  apply_selection
+elif [[ -t 0 && -t 1 ]]; then
+  need_pkg whiptail whiptail
+  CHECKLIST_ARGS=()
+  for entry in "${MAPS[@]}"; do
+    src="${entry%%:*}"
+    sub="${entry##*:}"
+    state="OFF"
+    [[ -n "${DEFAULT_ON[$sub]:-}" ]] && state="ON"
+    CHECKLIST_ARGS+=("$sub" "$(checklist_desc_for "$src" "$sub")" "$state")
+  done
+  SELECTED=$(whiptail --title "Btrfs-Subvolumes auswählen" \
+    --checklist "Universell sinnvolle Subvolumes sind vorausgewählt. Einträge mit 'no-compress' behalten CoW/Prüfsummen, bekommen aber per Btrfs-Property compression=no vor der Datenkopie. Volume-Subvolumes (*-volumes) aktivieren automatisch ihr Eltern-Subvolume. Leertaste = ab-/anwählen, Enter = bestätigen.\nAbgewählte Pfade bleiben einfach Teil von @ (Root)." \
+    24 78 14 \
+    "${CHECKLIST_ARGS[@]}" \
+    3>&1 1>&2 2>&3) || { echo "Abgebrochen." >&2; umount "$MNT"; exit 1; }
+  eval "SELECTED_ARR=($SELECTED)"
+
+  apply_selection
 else
   echo ">>> Kein interaktives Terminal erkannt - nur die universell sinnvollen Subvolumes werden angelegt (kein Auswahldialog)."
   FILTERED_MAPS=()
@@ -412,7 +815,7 @@ else
   echo ">>> Ausgewählt: ${#MAPS[@]} Subvolumes."
 fi
 
-if [[ ${#MAPS[@]} -eq 0 ]]; then
+if [[ ${#MAPS[@]} -eq 0 && $INCREMENTAL -eq 1 ]]; then
   echo ">>> Nichts ausgewählt - nichts zu tun."
   umount "$MNT"
   exit 0
@@ -509,6 +912,8 @@ declare -A SRC_SERVICE=(
   ["/var/lib/docker/volumes"]="docker"
   ["/var/lib/containers"]="podman podman.socket podman-restart crio containerd"
   ["/var/lib/containers/storage/volumes"]="podman podman.socket podman-restart crio containerd"
+  ["/var/snap/microk8s/common"]="snap:microk8s"
+  ["/var/lib/k8s-storage"]="snap:microk8s"
 )
 declare -a STOPPED_SERVICES=()
 declare -A ALREADY_HANDLED=()
@@ -517,7 +922,11 @@ restart_stopped_services() {
   local svc
   for svc in "${STOPPED_SERVICES[@]}"; do
     echo ">>> Starte $svc wieder"
-    systemctl start "$svc" || echo "WARNUNG: $svc konnte nicht neu gestartet werden – bitte manuell prüfen." >&2
+    if [[ "$svc" == snap:* ]]; then
+      snap start "${svc#snap:}" || echo "WARNUNG: $svc konnte nicht neu gestartet werden – bitte manuell prüfen." >&2
+    else
+      systemctl start "$svc" || echo "WARNUNG: $svc konnte nicht neu gestartet werden – bitte manuell prüfen." >&2
+    fi
   done
   STOPPED_SERVICES=()
 }
@@ -527,7 +936,15 @@ for entry in "${MAPS[@]}"; do
   for svc in ${SRC_SERVICE[$src]:-}; do
     if [[ -z "${ALREADY_HANDLED[$svc]:-}" ]]; then
       ALREADY_HANDLED[$svc]=1
-      if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      if [[ "$svc" == snap:* ]]; then
+        # Snap-Dienste (z. B. MicroK8s) gesammelt per "snap stop" anhalten.
+        if command -v snap >/dev/null 2>&1 \
+           && snap services "${svc#snap:}" 2>/dev/null | awk 'NR>1 && $3=="active"{f=1} END{exit !f}'; then
+          echo ">>> Stoppe Snap ${svc#snap:} für eine konsistente Kopie"
+          snap stop "${svc#snap:}"
+          STOPPED_SERVICES+=("$svc")
+        fi
+      elif systemctl is-active --quiet "$svc" 2>/dev/null; then
         echo ">>> Stoppe $svc für eine konsistente Kopie"
         systemctl stop "$svc"
         STOPPED_SERVICES+=("$svc")
@@ -540,15 +957,42 @@ echo ">>> Übertrage /root, /home, /var/... in ihre Subvolumes"
 for entry in "${MAPS[@]}"; do
   src="${entry%%:*}"
   sub="${entry##*:}"
-  # /var/lib/docker/volumes und /var/lib/containers/storage/volumes bekommen
-  # weiter unten ihr eigenes Subvolume - hier von der jeweiligen Elternkopie
-  # ausschliessen, sonst landen sie doppelt (einmal hier, einmal separat).
-  case "$src" in
-    /var/lib/docker) sync_dir "$src" "$sub" --exclude=/volumes/* ;;
-    /var/lib/containers) sync_dir "$src" "$sub" --exclude=/storage/volumes/* ;;
-    *) sync_dir "$src" "$sub" ;;
-  esac
+  # Verschachtelte Ziele (z. B. @docker-volumes unter @docker) werden hier generisch
+  # aus MAPS abgeleitet und von der Elternkopie ausgeschlossen.
+  nested_excludes=()
+  for other in "${MAPS[@]}"; do
+    osrc="${other%%:*}"
+    if [[ "$osrc" == "$src"/* ]]; then
+      nested_excludes+=(--exclude="${osrc#"$src"}/*")
+    fi
+  done
+  sync_dir "$src" "$sub" "${nested_excludes[@]}"
 done
+
+# --- Swap-Dateien auf diesem Btrfs erkennen (nur Erstmigration/--finish-migration) ---
+# Eine Swap-Datei darf nicht per rsync (CoW) in @ landen: swapon scheitert dann, und
+# Snapshots von @ wuerden mit aktiver Swap-Datei fehlschlagen. Sie bekommt deshalb ein
+# eigenes Subvolume @swap (eingehaengt unter /swap) und wird dort neu angelegt.
+SWAP_OLD_PATH=""
+SWAP_SIZE=0
+if [[ $INCREMENTAL -eq 0 ]]; then
+  while read -r swapfile; do
+    [[ -n "$swapfile" ]] || continue
+    swap_fs=$(findmnt -n -o FSTYPE -T "$swapfile" 2>/dev/null || true)
+    swap_src=$(findmnt -n -o SOURCE -T "$swapfile" 2>/dev/null || true)
+    if [[ "$swap_fs" == "btrfs" && "${swap_src%%[*}" == "$ROOT_DEV" ]]; then
+      if [[ -z "$SWAP_OLD_PATH" ]]; then
+        SWAP_OLD_PATH="$swapfile"
+        SWAP_SIZE=$(stat -c %s "$swapfile")
+      else
+        echo "WARNUNG: Weitere Swap-Datei $swapfile auf Btrfs wird nicht migriert (nur die erste)." >&2
+      fi
+    fi
+  done < <(swapon --noheadings --raw --show=NAME,TYPE 2>/dev/null | awk '$2=="file"{print $1}')
+  if [[ -n "$SWAP_OLD_PATH" ]]; then
+    echo ">>> Swap-Datei $SWAP_OLD_PATH ($(( SWAP_SIZE / 1024 / 1024 )) MiB) wird nach @swap (/swap/swapfile) migriert."
+  fi
+fi
 
 # --- fstab im laufenden System anpassen ---
 FSTAB="/etc/fstab"
@@ -580,6 +1024,32 @@ if [[ $INCREMENTAL -eq 0 ]]; then
 
   # Root mit subvol=@
   add_fstab_entry / @ "noatime,compress=zstd,space_cache=v2" 1
+
+  if [[ -n "$SWAP_OLD_PATH" ]]; then
+    echo ">>> Lege @swap an und erzeuge dort die neue Swap-Datei"
+    create_subvol "@swap"
+    chattr +C "$MNT/@swap"
+    swap_new="$MNT/@swap/swapfile"
+    rm -f "$swap_new"
+    if btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+      btrfs filesystem mkswapfile --size "${SWAP_SIZE}" "$swap_new"
+    else
+      truncate -s 0 "$swap_new"
+      chattr +C "$swap_new"
+      fallocate -l "${SWAP_SIZE}" "$swap_new"
+      chmod 600 "$swap_new"
+      mkswap "$swap_new" >/dev/null
+    fi
+    tmp="${FSTAB}.new"
+    awk -v old="$SWAP_OLD_PATH" '
+      $0 !~ /^[[:space:]]*#/ && $1 == old && $3 == "swap" { print "#OLD-SWAP " $0; next }
+      { print }
+    ' "$FSTAB" > "$tmp"
+    mv "$tmp" "$FSTAB"
+    add_fstab_entry /swap @swap "noatime" 0
+    echo "/swap/swapfile none swap defaults 0 0" >> "$FSTAB"
+    mkdir -p "$MNT/@/swap" /swap
+  fi
 fi
 
 # weitere Mounts (pass=2), Optionen aus SUBVOL_OPTS
@@ -590,28 +1060,6 @@ for entry in "${MAPS[@]}"; do
 done
 
 if [[ $INCREMENTAL -eq 0 ]]; then
-  # --- GRUB-Konfiguration im laufenden System anpassen ---
-  if [[ -f /etc/default/grub ]]; then
-    if grep -q "@rootfs" /etc/default/grub; then
-      echo ">>> Ersetze @rootfs durch @ in /etc/default/grub"
-      sed -i 's/@rootfs/@/g' /etc/default/grub
-    else
-      echo ">>> In /etc/default/grub kein @rootfs gefunden – ok."
-    fi
-
-    if command -v update-grub >/dev/null 2>&1; then
-      echo ">>> update-grub ausführen"
-      update-grub
-    elif command -v grub-mkconfig >/dev/null 2>&1; then
-      echo ">>> grub-mkconfig -o /boot/grub/grub.cfg ausführen"
-      grub-mkconfig -o /boot/grub/grub.cfg
-    else
-      echo ">>> Hinweis: Weder update-grub noch grub-mkconfig gefunden – bitte ggf. manuell GRUB-Konfiguration aktualisieren."
-    fi
-  else
-    echo "WARNUNG: /etc/default/grub nicht gefunden – GRUB nicht angepasst." >&2
-  fi
-
   # Im initialen Modus muessen optionale APT-Pakete vor der Root-Kopie
   # installiert werden, damit Paketdateien und dpkg-Status in @ landen.
   offer_optional_btrfs_tools
@@ -636,6 +1084,9 @@ if [[ $INCREMENTAL -eq 0 ]]; then
   for entry in "${MAPS[@]}"; do
     RSYNC_ROOT_EXCLUDES+=(--exclude="${entry%%:*}/*")
   done
+  if [[ -n "$SWAP_OLD_PATH" ]]; then
+    RSYNC_ROOT_EXCLUDES+=(--exclude="$SWAP_OLD_PATH")
+  fi
   rsync -axHAX --delete "${RSYNC_ROOT_EXCLUDES[@]}" / "$MNT/@"
 fi
 
@@ -671,7 +1122,7 @@ prepare_mp() {
   rel="${info#*:}"
   target="$MNT/$parent_subvol$rel" # z.B. /mnt/btrfs-root/@containers/storage/volumes
   mkdir -p "$target"
-  rm -rf "$target"/* 2>/dev/null || true
+  rm -rf "${target:?}"/* 2>/dev/null || true
 }
 
 echo ">>> Mountpoints im neuen Root (@) vorbereiten"
@@ -681,22 +1132,10 @@ done
 
 # --- Default-Subvolume auf @ setzen (im inkrementellen Modus ohnehin schon
 # korrekt gesetzt; set-default ist idempotent, daher hier kein Unterschied) ---
-echo ">>> Setze Default-Subvolume auf @"
-set +e
-SUBVOL_ID=$(btrfs subvolume list "$MNT" | awk '$NF=="@" {print $2}')
-RET_LIST=$?
-if [[ $RET_LIST -ne 0 ]]; then
-  echo "WARNUNG: btrfs subvolume list hat einen Fehler geliefert (Code $RET_LIST). Default-Subvolume wird NICHT geändert."
-else
-  if [[ -n "$SUBVOL_ID" ]]; then
-    if ! btrfs subvolume set-default "$SUBVOL_ID" "$MNT"; then
-      echo "WARNUNG: btrfs subvolume set-default ist fehlgeschlagen – bitte manuell prüfen."
-    fi
-  else
-    echo "WARNUNG: Konnte Subvolume-ID für @ nicht ermitteln – Default-Subvolume NICHT gesetzt."
-  fi
+if [[ $INCREMENTAL -eq 0 ]]; then
+  # Bootkonfiguration im neuen Root erzeugen (Hintergrund und Funktionen: siehe unten).
+  regenerate_boot_in_new_root
 fi
-set -e
 
 echo ">>> Erzeuge Mountpoints im laufenden System (falls noch nicht vorhanden)"
 for entry in "${MAPS[@]}"; do
