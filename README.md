@@ -71,6 +71,9 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - `@journal-remote`
   - `@microk8s`
   - `@k8s-storage`
+  - `@borg`
+  - `@snapd`
+  - `@containerd`
 
 - Copies the current root filesystem to `@` (excluding `/dev`, `/proc`, `/sys`, `/run`, `/mnt`, `/media`, `/lost+found`, plus — derived automatically from the mapping below — every path that gets its own subvolume).
 - Copies the content of these directories into their matching subvolumes:
@@ -105,6 +108,9 @@ On a Debian (or Debian-based) system with a Btrfs root filesystem, the script:
   - `/var/log/journal/remote` → `@journal-remote`
   - `/var/snap/microk8s/common` → `@microk8s`
   - `/var/lib/k8s-storage` → `@k8s-storage`
+  - `/var/lib/borg` → `@borg`
+  - `/var/lib/snapd` → `@snapd`
+  - `/var/lib/containerd` → `@containerd`
 
   Database and datastore subvolumes (`@mongodb`, `@mysql`, `@postgresql`, `@chroma`, `@clamav`, `@stalwart`, `@elasticsearch`, `@opensearch`, `@clickhouse`, `@cassandra`, `@couchdb`, `@neo4j`, `@rabbitmq`) as well as named Docker/Podman volumes (`@docker-volumes`, `@containers-volumes`) keep normal Btrfs mounts with CoW and checksums, but get `btrfs property set ... compression no` before data is copied. This avoids relying on per-subvolume `compress`/`nodatacow` fstab options, which Btrfs does not support reliably for mounts of the same filesystem. Image layers and metadata in `@docker`/`@containers` themselves stay on the normal compressed policy.
 
@@ -216,9 +222,24 @@ At this point, Timeshift can use `@` as the root subvolume and your layout is re
 | `--cleanup-old-root` | After a successful reboot from `@`: deletes the old root (`@rootfs` and/or the root directories in the Btrfs top level). Refuses to run unless `/` runs from `@`; shows what will be deleted and asks for `ja` (or use `--yes`). `@…` subvolumes and `timeshift-btrfs` are never touched. |
 | `--fix-boot` | For a system whose `/` already runs from `@` but whose GRUB still reads a stale `/boot` copy in the top level (symptom: `/proc/cmdline` shows `BOOT_IMAGE=/boot/vmlinuz-…` without `rootflags=subvol=@`, and an older kernel than the newest installed one runs). Rewrites GRUB, restores the top level as default subvolume and saves the old configuration to `/root/btrfs-layout-boot-backup-<time>`. Reboot afterwards. |
 | `--subvols LIST` | Comma-separated subvolume names (for example `@root,@home,@microk8s`) instead of the dialog or the default selection. |
+| `--map PATH:@NAME[:ALGO]` | Additional subvolume for any path (repeatable), for example `--map /srv/system/backups/borg:@borg:no`. `ALGO` is the Btrfs compression of that subvolume: `no`, `zstd` (default), `lzo` or `zlib`. Entries are selected automatically. Does not stop services: stop whatever uses the path first. Paths that are already mounted separately or collide with the built-in list are rejected. |
 | `--yes`, `-y` | Answers the "backup exists?" question automatically. |
 
 Non-interactive example for a Kubernetes node: `sudo ./setup-btrfs.sh --yes --subvols @root,@home,@log,@cache,@tmp,@tmp_var,@microk8s,@k8s-storage`.
+
+### Compression per subvolume
+
+Btrfs only lets you choose the compression **algorithm** per subvolume (`btrfs property set <subvolume> compression no|zstd|lzo|zlib`); the **level** cannot be set that way (see `man btrfs-property`). The level comes from the mount option (`compress=zstd:3`) and applies to the whole filesystem. Policy used by the script:
+
+| Subvolume | Algorithm | Why |
+|---|---|---|
+| `@borg` (`/var/lib/borg`) | `no` | Borg repositories are already compressed and encrypted. |
+| `@snapd` (`/var/lib/snapd`) | `no` | Snap images are SquashFS, already compressed. |
+| `@containerd` (`/var/lib/containerd`) | default (`zstd`) | Image layers compress well, like `@docker`. |
+| databases, `*-volumes`, `@microk8s`, `@k8s-storage`, `@journal-remote` | `no` | Hot data; keeps CoW and checksums without compression overhead. |
+| everything else | default (`zstd:3`) | With `compress` (not `compress-force`) Btrfs skips incompressible files after a sample, so mixed data such as `.tar.gz` backups costs little CPU. |
+
+After `@snapd` a reboot is recommended: running snaps keep their loop-mounted images from the old location until then.
 
 ### Tests
 

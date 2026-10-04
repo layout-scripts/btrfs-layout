@@ -71,6 +71,9 @@ En un sistema basado en Debian con root en Btrfs, el script:
   - `@journal-remote`
   - `@microk8s`
   - `@k8s-storage`
+  - `@borg`
+  - `@snapd`
+  - `@containerd`
 
 - Copia el sistema root actual a `@` (excluyendo `/dev`, `/proc`, `/sys`, `/run`, `/mnt`, `/media`, `/lost+found`, además de — derivado automáticamente del mapeo de abajo — cada ruta que tenga su propio subvolumen).
 - Copia el contenido de los directorios principales a sus subvolúmenes:
@@ -105,6 +108,9 @@ En un sistema basado en Debian con root en Btrfs, el script:
   - `/var/log/journal/remote` → `@journal-remote`
   - `/var/snap/microk8s/common` → `@microk8s`
   - `/var/lib/k8s-storage` → `@k8s-storage`
+  - `/var/lib/borg` → `@borg`
+  - `/var/lib/snapd` → `@snapd`
+  - `/var/lib/containerd` → `@containerd`
 
   Los subvolúmenes de bases de datos y datastores (`@mongodb`, `@mysql`, `@postgresql`, `@chroma`, `@clamav`, `@stalwart`, `@elasticsearch`, `@opensearch`, `@clickhouse`, `@cassandra`, `@couchdb`, `@neo4j`, `@rabbitmq`) y los volúmenes nombrados de Docker/Podman (`@docker-volumes`, `@containers-volumes`) conservan montajes Btrfs normales con CoW y checksums, pero reciben `btrfs property set ... compression no` antes de copiar los datos. Así el script no depende de opciones `compress`/`nodatacow` en fstab por subvolumen, que Btrfs no separa de forma fiable entre montajes del mismo sistema de archivos. Las capas de imagen y metadatos en `@docker`/`@containers` siguen usando la política comprimida normal.
 
@@ -216,9 +222,24 @@ En este punto, Timeshift puede usar `@` como subvolumen root y tu diseño está 
 | `--cleanup-old-root` | Tras reiniciar correctamente desde `@`: borra la raíz antigua (`@rootfs` y/o los directorios raíz en el nivel superior de Btrfs). Solo se ejecuta si `/` funciona desde `@`; muestra lo que se borrará y pide `ja` (o usa `--yes`). Los subvolúmenes `@…` y `timeshift-btrfs` no se tocan. |
 | `--fix-boot` | Para un sistema cuyo `/` ya funciona desde `@` pero cuyo GRUB sigue leyendo una copia obsoleta de `/boot` en el nivel superior (síntoma: `/proc/cmdline` muestra `BOOT_IMAGE=/boot/vmlinuz-…` sin `rootflags=subvol=@`, y se ejecuta un kernel más antiguo que el más reciente instalado). Reescribe GRUB, restaura el nivel superior como subvolumen por defecto y guarda la configuración antigua en `/root/btrfs-layout-boot-backup-<hora>`. Después hay que reiniciar. |
 | `--subvols LISTA` | Nombres de subvolúmenes separados por comas (por ejemplo `@root,@home,@microk8s`) en lugar del diálogo o la selección por defecto. |
+| `--map RUTA:@NOMBRE[:ALGO]` | Subvolumen adicional para cualquier ruta (repetible), por ejemplo `--map /srv/system/backups/borg:@borg:no`. `ALGO` es la compresión Btrfs de ese subvolumen: `no`, `zstd` (por defecto), `lzo` o `zlib`. Las entradas se seleccionan automáticamente. No detiene servicios: detén antes lo que use la ruta. Se rechazan las rutas ya montadas por separado o que colisionen con la lista fija. |
 | `--yes`, `-y` | Responde automáticamente a «¿hay copia de seguridad?». |
 
 Ejemplo no interactivo para un nodo de Kubernetes: `sudo ./setup-btrfs.sh --yes --subvols @root,@home,@log,@cache,@tmp,@tmp_var,@microk8s,@k8s-storage`.
+
+### Compresión por subvolumen
+
+Btrfs solo permite elegir por subvolumen el **algoritmo** (`btrfs property set <subvolumen> compression no|zstd|lzo|zlib`); el **nivel** no se puede fijar así (véase `man btrfs-property`). El nivel viene de la opción de montaje (`compress=zstd:3`) y vale para todo el sistema de archivos. Política del script:
+
+| Subvolumen | Algoritmo | Motivo |
+|---|---|---|
+| `@borg` (`/var/lib/borg`) | `no` | Los repositorios de Borg ya están comprimidos y cifrados. |
+| `@snapd` (`/var/lib/snapd`) | `no` | Las imágenes snap son SquashFS, ya comprimidas. |
+| `@containerd` (`/var/lib/containerd`) | por defecto (`zstd`) | Las capas de imágenes se comprimen bien, como en `@docker`. |
+| bases de datos, `*-volumes`, `@microk8s`, `@k8s-storage`, `@journal-remote` | `no` | Datos activos; conserva CoW y sumas de verificación sin coste de compresión. |
+| todo lo demás | por defecto (`zstd:3`) | Con `compress` (no `compress-force`) Btrfs descarta los archivos incompresibles tras una muestra, así que datos mixtos como copias `.tar.gz` cuestan poca CPU. |
+
+Tras `@snapd` se recomienda reiniciar: los snaps en ejecución mantienen hasta entonces sus imágenes montadas por loop desde la ubicación antigua.
 
 ### Pruebas
 

@@ -51,14 +51,44 @@ if ! "$SCRIPT" --help | grep -q -- '--fix-boot'; then
 else
   echo "  ok    --help nennt --fix-boot"
 fi
+if ! "$SCRIPT" --help | grep -q -- '--map'; then
+  echo "  FAIL  --help nennt --map nicht"; fail=1
+else
+  echo "  ok    --help nennt --map"
+fi
 if ! "$SCRIPT" --help | grep -q -- '--finish-migration'; then
   echo "  FAIL  --help nennt --finish-migration nicht"; fail=1
 else
   echo "  ok    --help nennt --finish-migration"
 fi
 
+# --map: Validierung (gueltige Eingaben ergeben "PFAD @NAME ALGO", ungueltige scheitern).
+check "map: Standardalgorithmus zstd"   "/srv/x @x zstd" "$(validate_map_spec '/srv/x:@x')"
+check "map: Algorithmus no"             "/srv/x @x no"   "$(validate_map_spec '/srv/x:@x:no')"
+check "map: none wird no"               "/srv/x @x no"   "$(validate_map_spec '/srv/x:@x:none')"
+check "map: lzo"                        "/a/b-c_d.e @n-1 lzo" "$(validate_map_spec '/a/b-c_d.e:@n-1:lzo')"
+for bad in 'srv/x:@x' '/srv/x:x' '/srv/x:@x:brotli' '/srv/x/:@x' '/:@x' '/srv/../etc:@x' \
+           '/srv/x:@x:no:extra' '/srv/x y:@x' '/srv/x:@x y' '/srv/x:@' ':@x' '/srv/x:' ''; do
+  if validate_map_spec "$bad" >/dev/null 2>&1; then
+    echo "  FAIL  ungueltiges --map akzeptiert: '$bad'"; fail=1
+  else
+    echo "  ok    ungueltiges --map abgelehnt: '$bad'"
+  fi
+done
+# Skript-Ebene: ungueltige/kollidierende --map-Angaben beenden mit Exit 2 (vor der Root-Pruefung).
+# (Kollisionen mit der festen Liste, z. B. --map /home:@home2, werden erst nach der Root-Pruefung
+# erkannt und im VM-Test geprueft.)
+for args in "--map /srv/x" "--map /srv/x:@x:brotli" \
+            "--map /srv/z:@z --map /srv/z:@z2" "--map /srv/z:@z --map /srv/q:@z" \
+            "--map /srv/a:@a --cleanup-old-root" "--map /srv/a:@a --fix-boot"; do
+  # shellcheck disable=SC2086
+  rc=0
+  "$SCRIPT" $args >/dev/null 2>&1 || rc=$?
+  check "Skript lehnt ab (Exit 2): $args" 2 "$rc"
+done
+
 # Neue Mappings muessen vorhanden sein und zu den Optionstabellen passen.
-for sub in @microk8s @k8s-storage @journal-remote; do
+for sub in @microk8s @k8s-storage @journal-remote @borg @snapd @containerd; do
   if grep -Fq ":$sub\"" "$SCRIPT" && grep -Fq "[$sub]=" "$SCRIPT"; then
     echo "  ok    Mapping $sub vorhanden"
   else

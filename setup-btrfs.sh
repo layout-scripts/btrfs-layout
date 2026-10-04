@@ -17,6 +17,13 @@ Verwendung: setup-btrfs.sh [Optionen]
                          Default-Subvolume auf den Top-Level zurück. Danach Reboot.
   --subvols LISTE        Kommagetrennte Subvolume-Namen (z. B. @root,@home,@microk8s) statt
                          Auswahldialog bzw. Standardauswahl.
+  --map PFAD:@NAME[:ALGO]
+                         Zusätzliches Subvolume für einen beliebigen Pfad (mehrfach nutzbar),
+                         z. B. --map /srv/system/backups/borg:@borg:no. ALGO ist die
+                         Btrfs-Kompression des Subvolumes: no, zstd (Standard), lzo oder zlib.
+                         Die Stufe (zstd:3) lässt sich pro Subvolume nicht setzen, sie kommt
+                         aus den Mountoptionen. Die Einträge werden automatisch ausgewählt;
+                         Dienste, die den Pfad nutzen, vorher selbst beenden.
   --yes, -y              Rückfrage "Backup vorhanden?" automatisch bejahen.
   -h, --help             Diese Hilfe.
 USAGE
@@ -43,6 +50,32 @@ detect_mode() {
   fi
 }
 
+# validate_map_spec "PFAD:@NAME[:ALGO]" -> gibt "PFAD @NAME ALGO" aus, sonst Meldung auf
+# stderr und Exit 1. ALGO: no (auch none), zstd, lzo, zlib; Standard zstd.
+validate_map_spec() {
+  local spec="$1" path name algo rest
+  IFS=: read -r path name algo rest <<< "$spec"
+  if [[ -n "$rest" ]]; then
+    echo "FEHLER: --map '$spec': zu viele ':'-Felder (erwartet PFAD:@NAME[:ALGO])." >&2
+    return 1
+  fi
+  if [[ ! "$path" =~ ^/[A-Za-z0-9._+/-]+$ || "$path" == */ || "$path" =~ (^|/)\.\.(/|$) ]]; then
+    echo "FEHLER: --map '$spec': Pfad muss absolut sein, darf nicht auf '/' enden, kein '..' enthalten und nur [A-Za-z0-9._+/-] verwenden." >&2
+    return 1
+  fi
+  if [[ ! "$name" =~ ^@[A-Za-z0-9._-]+$ ]]; then
+    echo "FEHLER: --map '$spec': Subvolume-Name muss mit '@' beginnen und nur [A-Za-z0-9._-] enthalten." >&2
+    return 1
+  fi
+  algo="${algo:-zstd}"
+  case "$algo" in
+    no|none) algo=no ;;
+    zstd|lzo|zlib) ;;
+    *) echo "FEHLER: --map '$spec': ALGO muss no, zstd, lzo oder zlib sein (ist: $algo)." >&2; return 1 ;;
+  esac
+  echo "$path $name $algo"
+}
+
 # Zum Testen der Funktionen oben per "source" ohne Nebenwirkungen laden.
 if [[ "${SETUP_BTRFS_SOURCE_ONLY:-}" == 1 ]]; then
   return 0 2>/dev/null || exit 0
@@ -53,12 +86,14 @@ MODE_CLEANUP=0
 MODE_FIXBOOT=0
 ASSUME_YES=0
 SUBVOLS_ARG=""
+declare -a EXTRA_MAP_SPECS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --finish-migration) MODE_FINISH=1 ;;
     --cleanup-old-root) MODE_CLEANUP=1 ;;
     --fix-boot) MODE_FIXBOOT=1 ;;
     --subvols) SUBVOLS_ARG="${2:?--subvols braucht eine Liste}"; shift ;;
+    --map) EXTRA_MAP_SPECS+=("${2:?--map braucht PFAD:@NAME[:ALGO]}"); shift ;;
     --yes|-y) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
@@ -67,6 +102,23 @@ while [[ $# -gt 0 ]]; do
 done
 if (( MODE_FINISH + MODE_CLEANUP + MODE_FIXBOOT > 1 )); then
   echo "--finish-migration, --cleanup-old-root und --fix-boot schließen sich gegenseitig aus." >&2
+  exit 2
+fi
+declare -A seen_map_paths=() seen_map_names=()
+for spec in "${EXTRA_MAP_SPECS[@]}"; do
+  map_path=""
+  map_name=""
+  read -r map_path map_name _ < <(validate_map_spec "$spec") || true
+  [[ -n "$map_path" ]] || { validate_map_spec "$spec" >/dev/null || exit 2; }
+  if [[ -n "${seen_map_paths[$map_path]:-}" || -n "${seen_map_names[$map_name]:-}" ]]; then
+    echo "FEHLER: --map '$spec': Pfad oder Name kommt in mehreren --map-Angaben vor." >&2
+    exit 2
+  fi
+  seen_map_paths[$map_path]=1
+  seen_map_names[$map_name]=1
+done
+if (( ${#EXTRA_MAP_SPECS[@]} > 0 && (MODE_CLEANUP + MODE_FIXBOOT) > 0 )); then
+  echo "--map passt nur zur Erstmigration, zum inkrementellen Lauf und zu --finish-migration." >&2
   exit 2
 fi
 
@@ -466,6 +518,9 @@ mkdir -p "$MNT"
 
 echo ">>> Mount Top-Level (subvolid=5) von $ROOT_DEV nach $MNT"
 mount -o subvolid=5 "$ROOT_DEV" "$MNT"
+# Bei jedem vorzeitigen Ende (Fehler, exit) den Top-Level wieder aushaengen, sonst scheitert der
+# naechste Lauf mit "bereits gemountet". Normale Pfade haengen selbst aus; ein zweites umount ist harmlos.
+trap 'umount "$MNT" 2>/dev/null || true' EXIT
 
 echo ">>> Vorhandene Subvolumes:"
 btrfs subvolume list "$MNT" || true
@@ -565,6 +620,11 @@ declare -a ALL_MAPS=(
 # Kubernetes (MicroK8s-Snap): Laufzeitdaten samt Datastore und lokale PersistentVolumes.
 "/var/snap/microk8s/common:@microk8s"
 "/var/lib/k8s-storage:@k8s-storage"
+# Weitere optionale Pfade: Borg-Repositories (schon komprimiert und verschluesselt),
+# Snap-Images (SquashFS) und der Docker-Host-Containerd.
+"/var/lib/borg:@borg"
+"/var/lib/snapd:@snapd"
+"/var/lib/containerd:@containerd"
 # Datenbank-/Datastore-Pfade: stark vom konkreten Software-Stack abhaengig,
 # deshalb im Auswahldialog ganz unten.
 "/var/lib/mongodb:@mongodb"
@@ -617,6 +677,9 @@ declare -A SUBVOL_OPTS=(
   [@journal-remote]="noatime,compress=zstd,space_cache=v2"
   [@microk8s]="noatime,compress=zstd,space_cache=v2"
   [@k8s-storage]="noatime,compress=zstd,space_cache=v2"
+  [@borg]="noatime,compress=zstd,space_cache=v2"
+  [@snapd]="noatime,compress=zstd,space_cache=v2"
+  [@containerd]="noatime,compress=zstd,space_cache=v2"
 )
 
 # Diese Subvolumes behalten CoW und Checksums, werden aber per
@@ -641,7 +704,15 @@ declare -A NO_COMPRESSION_SUBVOLS=(
   [@journal-remote]=1
   [@microk8s]=1
   [@k8s-storage]=1
+  [@borg]=1
+  [@snapd]=1
 )
+
+# Explizite Kompressionsalgorithmen (zstd, lzo, zlib), die per btrfs-property gesetzt werden.
+# Nur der Algorithmus laesst sich pro Subvolume festlegen, nicht die Stufe; diese kommt aus
+# den Mountoptionen (compress=zstd:N) und gilt fuer das ganze Dateisystem. Subvolumes ohne
+# Eintrag und ohne NO_COMPRESSION_SUBVOLS erben die Mountoption.
+declare -A SUBVOL_COMPRESSION=()
 
 # Volume-Subvolumes liegen INNERHALB ihres Eltern-Subvolumes und brauchen es
 # als eigenes Subvolume (sonst legt prepare_mp verwaiste Verzeichnisse unter
@@ -650,6 +721,26 @@ declare -A VOLUME_PARENT=(
   [@docker-volumes]=@docker
   [@containers-volumes]=@containers
 )
+
+# --- --map-Eintraege registrieren (nach der festen Liste, vor der Klassifizierung) ---
+declare -a EXTRA_MAP_NAMES=()
+for spec in "${EXTRA_MAP_SPECS[@]}"; do
+  read -r map_path map_name map_algo < <(validate_map_spec "$spec")
+  for entry in "${ALL_MAPS[@]}"; do
+    if [[ "${entry%%:*}" == "$map_path" || "${entry##*:}" == "$map_name" ]]; then
+      echo "FEHLER: --map '$spec' kollidiert mit dem vorhandenen Eintrag '$entry'." >&2
+      exit 2
+    fi
+  done
+  ALL_MAPS+=("$map_path:$map_name")
+  SUBVOL_OPTS[$map_name]="noatime,compress=zstd,space_cache=v2"
+  if [[ "$map_algo" == "no" ]]; then
+    NO_COMPRESSION_SUBVOLS[$map_name]=1
+  else
+    SUBVOL_COMPRESSION[$map_name]="$map_algo"
+  fi
+  EXTRA_MAP_NAMES+=("$map_name")
+done
 
 # --- Bereits erledigte bzw. anderweitig belegte Zielpfade aussortieren ---
 # Drei Kategorien statt eines Alles-oder-nichts-Abbruchs:
@@ -710,6 +801,11 @@ declare -A DEFAULT_ON=(
   [@tmp]=1
 )
 
+# --map-Eintraege hat der Aufrufer ausdruecklich verlangt: automatisch ausgewaehlt.
+for name in "${EXTRA_MAP_NAMES[@]}"; do
+  DEFAULT_ON[$name]=1
+done
+
 checklist_desc_for() {
   local src="$1" sub="$2" category compression
   if [[ -n "${DEFAULT_ON[$sub]:-}" ]]; then
@@ -719,6 +815,8 @@ checklist_desc_for() {
   fi
   if [[ -n "${NO_COMPRESSION_SUBVOLS[$sub]:-}" ]]; then
     compression="no-compress"
+  elif [[ -n "${SUBVOL_COMPRESSION[$sub]:-}" ]]; then
+    compression="${SUBVOL_COMPRESSION[$sub]}"
   else
     compression="compress"
   fi
@@ -774,6 +872,7 @@ apply_selection() {
 
 if [[ -n "$SUBVOLS_ARG" ]]; then
   IFS=',' read -r -a SELECTED_ARR <<< "$SUBVOLS_ARG"
+  SELECTED_ARR+=("${EXTRA_MAP_NAMES[@]}")
   for sel in "${SELECTED_ARR[@]}"; do
     known=0
     for entry in "${ALL_MAPS[@]}"; do
@@ -821,6 +920,18 @@ if [[ ${#MAPS[@]} -eq 0 && $INCREMENTAL -eq 1 ]]; then
   exit 0
 fi
 
+# --- Eltern vor Kindern: "mount -a" arbeitet die fstab der Reihe nach ab, ein Elternpfad
+# darf nicht ueber einen schon gemounteten Kindpfad gemountet werden. Stabile Sortierung
+# nach Pfadtiefe, die Reihenfolge innerhalb einer Tiefe bleibt erhalten. ---
+if [[ ${#MAPS[@]} -gt 1 ]]; then
+  mapfile -t MAPS < <(
+    for entry in "${MAPS[@]}"; do
+      src="${entry%%:*}"
+      printf '%s\t%s\n' "$(tr -cd '/' <<< "$src" | wc -c)" "$entry"
+    done | sort -s -n -k1,1 | cut -f2-
+  )
+fi
+
 # --- Speicherplatz-Check ---
 # Initial-Modus: jedes Byte auf / wird einmal dupliziert (landet in @ oder
 # einem eigenen Subvolume), der Gesamtbedarf entspricht also ungefaehr der
@@ -857,16 +968,31 @@ for entry in "${MAPS[@]}"; do
   create_subvol "${entry##*:}"
 done
 
-set_no_compression_policy() {
-  local subvol="$1" target prop
-  [[ -n "${NO_COMPRESSION_SUBVOLS[$subvol]:-}" ]] || return 0
+set_compression_policy() {
+  local subvol="$1" quiet="${2:-}" target prop algo want ok
+  if [[ -n "${NO_COMPRESSION_SUBVOLS[$subvol]:-}" ]]; then
+    algo=no
+  else
+    algo="${SUBVOL_COMPRESSION[$subvol]:-}"
+  fi
+  [[ -n "$algo" ]] || return 0
 
   target="$MNT/$subvol"
-  echo ">>> Deaktiviere Btrfs-Kompression für neue Daten in $subvol"
-  btrfs property set "$target" compression no
+  if [[ -z "$quiet" ]]; then
+    if [[ "$algo" == no ]]; then
+      echo ">>> Deaktiviere Btrfs-Kompression für neue Daten in $subvol"
+    else
+      echo ">>> Setze Btrfs-Kompression $algo für neue Daten in $subvol"
+    fi
+  fi
+  btrfs property set "$target" compression "$algo"
   prop=$(btrfs property get "$target" compression)
-  if [[ "$prop" != "compression=no" && "$prop" != "compression=none" ]]; then
-    echo "FEHLER: Konnte Kompression für $subvol nicht deaktivieren (Ist: ${prop:-<leer>})." >&2
+  want="compression=$algo"
+  ok=0
+  [[ "$prop" == "$want" ]] && ok=1
+  [[ "$algo" == no && "$prop" == "compression=none" ]] && ok=1
+  if [[ $ok -eq 0 ]]; then
+    echo "FEHLER: Konnte Kompression für $subvol nicht auf $algo setzen (Ist: ${prop:-<leer>})." >&2
     echo "Abbruch, damit Daten nicht versehentlich mit falscher Kompressions-Policy kopiert werden." >&2
     umount "$MNT"
     exit 1
@@ -874,7 +1000,7 @@ set_no_compression_policy() {
 }
 
 for entry in "${MAPS[@]}"; do
-  set_no_compression_policy "${entry##*:}"
+  set_compression_policy "${entry##*:}"
 done
 
 sync_dir() {
@@ -889,7 +1015,12 @@ sync_dir() {
   fi
 
   echo ">>> Übertrage $src nach $subvol (überschreibend)"
-  rsync -axHAX --delete "${extra_excludes[@]}" "$src"/ "$MNT/$subvol"/
+  # rsync -X gleicht die Xattrs des Ziels an die Quelle an und loescht dabei btrfs.compression
+  # (die per "btrfs property set compression" gesetzte Subvolume-Policy). Die Filterregeln
+  # nehmen btrfs.* und system.* (rsync verlangt bei eigenen x-Regeln die system-Filterung selbst)
+  # vom Kopieren und Loeschen aus, damit die Property erhalten bleibt und neue Dateien sie erben.
+  rsync -axHAX --delete --filter='-x system.*' --filter='-x btrfs.*' \
+    "${extra_excludes[@]}" "$src"/ "$MNT/$subvol"/
 }
 
 # --- Bekannte Dienste vor der Kopie stoppen (konsistente Daten statt
@@ -914,6 +1045,8 @@ declare -A SRC_SERVICE=(
   ["/var/lib/containers/storage/volumes"]="podman podman.socket podman-restart crio containerd"
   ["/var/snap/microk8s/common"]="snap:microk8s"
   ["/var/lib/k8s-storage"]="snap:microk8s"
+  ["/var/lib/containerd"]="docker.socket docker containerd"
+  ["/var/lib/snapd"]="snapd.socket snapd.service"
 )
 declare -a STOPPED_SERVICES=()
 declare -A ALREADY_HANDLED=()
@@ -993,6 +1126,11 @@ if [[ $INCREMENTAL -eq 0 ]]; then
     echo ">>> Swap-Datei $SWAP_OLD_PATH ($(( SWAP_SIZE / 1024 / 1024 )) MiB) wird nach @swap (/swap/swapfile) migriert."
   fi
 fi
+
+# Policy nach der Kopie nochmals sicherstellen (idempotent, Sicherheitsnetz zur rsync-Filterung).
+for entry in "${MAPS[@]}"; do
+  set_compression_policy "${entry##*:}" quiet
+done
 
 # --- fstab im laufenden System anpassen ---
 FSTAB="/etc/fstab"
