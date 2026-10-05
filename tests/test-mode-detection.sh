@@ -87,6 +87,21 @@ for args in "--map /srv/x" "--map /srv/x:@x:brotli" \
   check "Skript lehnt ab (Exit 2): $args" 2 "$rc"
 done
 
+# --fix-swap / --swap-size: Exklusivitaet und Validierung (vor der Root-Pruefung des Skripts).
+for args in "--fix-swap --fix-boot" "--fix-swap --cleanup-old-root" "--fix-swap --finish-migration" \
+            "--swap-size 4G" "--fix-swap --swap-size abc" "--fix-swap --swap-size 4" "--fix-swap --swap-size" \
+            "--fix-swap --map /srv/a:@a"; do
+  rc=0
+  # shellcheck disable=SC2086
+  "$SCRIPT" $args >/dev/null 2>&1 || rc=$?
+  check "Skript lehnt ab (Exit 2): $args" 2 "$rc"
+done
+if ! "$SCRIPT" --help | grep -q -- '--fix-swap'; then
+  echo "  FAIL  --help nennt --fix-swap nicht"; fail=1
+else
+  echo "  ok    --help nennt --fix-swap"
+fi
+
 # Neue Mappings muessen vorhanden sein und zu den Optionstabellen passen.
 for sub in @microk8s @k8s-storage @journal-remote @borg @snapd @containerd; do
   if grep -Fq ":$sub\"" "$SCRIPT" && grep -Fq "[$sub]=" "$SCRIPT"; then

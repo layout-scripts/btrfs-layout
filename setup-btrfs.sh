@@ -15,6 +15,12 @@ Verwendung: setup-btrfs.sh [Optionen]
   --fix-boot             Läuft / von @ und bootet GRUB trotzdem eine veraltete /boot-Kopie im
                          Top-Level (Kernel wird nie aktualisiert)? Schreibt GRUB neu und setzt das
                          Default-Subvolume auf den Top-Level zurück. Danach Reboot.
+  --fix-swap             Reparatur einer Swap-Datei auf Btrfs, die nicht aktiv ist ("swapon failed:
+                         Invalid argument", typisch nach einer Migration, die die Datei als normale
+                         CoW-Datei kopiert hat): legt das Subvolume @swap (ohne CoW) unter /swap an,
+                         erzeugt dort /swap/swapfile in der bisherigen Größe, passt /etc/fstab an und
+                         aktiviert den Swap sofort. Kein Reboot nötig.
+  --swap-size GRÖSSE     Größe der neuen Swap-Datei (z. B. 4G); Standard: Größe der bisherigen Datei.
   --subvols LISTE        Kommagetrennte Subvolume-Namen (z. B. @root,@home,@microk8s) statt
                          Auswahldialog bzw. Standardauswahl.
   --map PFAD:@NAME[:ALGO]
@@ -84,6 +90,8 @@ fi
 MODE_FINISH=0
 MODE_CLEANUP=0
 MODE_FIXBOOT=0
+MODE_FIXSWAP=0
+SWAP_SIZE=""
 ASSUME_YES=0
 SUBVOLS_ARG=""
 declare -a EXTRA_MAP_SPECS=()
@@ -92,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --finish-migration) MODE_FINISH=1 ;;
     --cleanup-old-root) MODE_CLEANUP=1 ;;
     --fix-boot) MODE_FIXBOOT=1 ;;
+    --fix-swap) MODE_FIXSWAP=1 ;;
+    --swap-size) [[ $# -ge 2 ]] || { echo "--swap-size braucht eine Größe (z. B. 4G)." >&2; exit 2; }; SWAP_SIZE="$2"; shift ;;
     --subvols) [[ $# -ge 2 ]] || { echo "--subvols braucht eine Liste." >&2; exit 2; }; SUBVOLS_ARG="$2"; shift ;;
     --map) [[ $# -ge 2 ]] || { echo "--map braucht PFAD:@NAME[:ALGO]." >&2; exit 2; }; EXTRA_MAP_SPECS+=("$2"); shift ;;
     --yes|-y) ASSUME_YES=1 ;;
@@ -100,9 +110,19 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
-if (( MODE_FINISH + MODE_CLEANUP + MODE_FIXBOOT > 1 )); then
-  echo "--finish-migration, --cleanup-old-root und --fix-boot schließen sich gegenseitig aus." >&2
+if (( MODE_FINISH + MODE_CLEANUP + MODE_FIXBOOT + MODE_FIXSWAP > 1 )); then
+  echo "--finish-migration, --cleanup-old-root, --fix-boot und --fix-swap schließen sich gegenseitig aus." >&2
   exit 2
+fi
+if [[ -n "$SWAP_SIZE" ]]; then
+  if [[ ! "$SWAP_SIZE" =~ ^[0-9]+[KMGkmg]$ ]]; then
+    echo "FEHLER: --swap-size muss Zahl plus K, M oder G sein (z. B. 4G), ist: $SWAP_SIZE" >&2
+    exit 2
+  fi
+  if [[ $MODE_FIXSWAP -eq 0 ]]; then
+    echo "--swap-size gehört zu --fix-swap." >&2
+    exit 2
+  fi
 fi
 declare -A seen_map_paths=() seen_map_names=()
 for spec in "${EXTRA_MAP_SPECS[@]}"; do
@@ -117,7 +137,7 @@ for spec in "${EXTRA_MAP_SPECS[@]}"; do
   seen_map_paths[$map_path]=1
   seen_map_names[$map_name]=1
 done
-if (( ${#EXTRA_MAP_SPECS[@]} > 0 && (MODE_CLEANUP + MODE_FIXBOOT) > 0 )); then
+if (( ${#EXTRA_MAP_SPECS[@]} > 0 && (MODE_CLEANUP + MODE_FIXBOOT + MODE_FIXSWAP) > 0 )); then
   echo "--map passt nur zur Erstmigration, zum inkrementellen Lauf und zu --finish-migration." >&2
   exit 2
 fi
@@ -450,8 +470,120 @@ if [[ $MODE_CLEANUP -eq 1 ]]; then
   exit $?
 fi
 
+# --fix-swap: Swap-Datei auf Btrfs reparieren. Eine per rsync oder cp nach @ kopierte Swap-Datei ist
+# CoW; swapon scheitert dann mit "Invalid argument". Neu angelegt wird sie in einem eigenen NOCOW-
+# Subvolume @swap (Mountpunkt /swap), das auch Snapshots von @ nicht blockiert.
+fix_swap() {
+  local fstab=/etc/fstab old_path size new=/swap/swapfile mnt=/mnt/btrfs-root bk confirm tmp
+  old_path=$(awk '$0 !~ /^[[:space:]]*#/ && $3 == "swap" && $1 ~ /^\// && $1 !~ /^\/dev\// { print $1; exit }' "$fstab")
+
+  if [[ "$(findmnt -no FSTYPE /)" != btrfs ]]; then
+    echo "FEHLER: / ist kein Btrfs-Dateisystem." >&2
+    exit 1
+  fi
+  if [[ -n "$old_path" ]] && swapon --noheadings --raw --show=NAME 2>/dev/null | grep -qx "$old_path"; then
+    echo ">>> Swap-Datei $old_path ist aktiv - nichts zu tun."
+    return 0
+  fi
+
+  if [[ -n "$SWAP_SIZE" ]]; then
+    size="$SWAP_SIZE"
+  elif [[ -n "$old_path" && -f "$old_path" ]]; then
+    size=$(stat -c %s "$old_path")
+  else
+    echo "FEHLER: Keine bisherige Swap-Datei gefunden. Größe mit --swap-size angeben (z. B. --swap-size 4G)." >&2
+    exit 1
+  fi
+
+  echo ">>> --fix-swap: ${old_path:-keine bisherige Swap-Datei} ist nicht aktiv."
+  echo ">>> Es wird das Subvolume @swap (ohne CoW) unter /swap angelegt, dort ${new} (${size}) erzeugt,"
+  echo ">>> /etc/fstab angepasst und der Swap sofort aktiviert. Die alte Datei wird danach gelöscht."
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    echo ">>> --yes angegeben - Bestätigung übersprungen."
+  elif [[ -t 0 ]]; then
+    read -r -p "Fortfahren? Exakt 'ja' eingeben: " confirm
+    [[ "$confirm" == "ja" ]] || { echo "Abgebrochen." >&2; exit 1; }
+  fi
+
+  bk="/root/btrfs-layout-swap-backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bk"
+  cp -a "$fstab" "$bk/fstab"
+
+  swap_fail() {
+    echo "FEHLER: $1" >&2
+    echo ">>> Stelle /etc/fstab aus $bk wieder her." >&2
+    cp -a "$bk/fstab" "$fstab"
+    systemctl daemon-reload 2>/dev/null || true
+    exit 1
+  }
+
+  # 1. Subvolume @swap im Top-Level anlegen (falls noch nicht vorhanden), NOCOW fuer neue Dateien
+  mkdir -p "$mnt"
+  mount -o subvolid=5 "$ROOT_DEV" "$mnt" || swap_fail "Top-Level konnte nicht gemountet werden."
+  # shellcheck disable=SC2064
+  trap "umount '$mnt' 2>/dev/null || true" EXIT
+  if ! btrfs subvolume list "$mnt" | awk '{print $NF}' | grep -qx '@swap'; then
+    btrfs subvolume create "$mnt/@swap" >/dev/null || swap_fail "@swap konnte nicht angelegt werden."
+  fi
+  chattr +C "$mnt/@swap" || swap_fail "NOCOW konnte auf @swap nicht gesetzt werden."
+  umount "$mnt"
+  trap - EXIT
+
+  # 2. /swap einhaengen (fstab-Eintrag nur, wenn es noch keinen gibt)
+  mkdir -p /swap
+  if ! grep -Eq '^[^#[:space:]]+[[:space:]]+/swap[[:space:]]+btrfs' "$fstab"; then
+    echo "UUID=${UUID} /swap btrfs noatime,subvol=@swap 0 0" >> "$fstab"
+  fi
+  systemctl daemon-reload
+  mountpoint -q /swap || mount /swap || swap_fail "/swap konnte nicht eingehängt werden."
+
+  # 3. Neue Swap-Datei (mkswapfile setzt NOCOW und legt sie ohne Luecken an)
+  rm -f "$new"
+  if btrfs filesystem mkswapfile --help >/dev/null 2>&1; then
+    btrfs filesystem mkswapfile --size "$size" "$new" >/dev/null || swap_fail "Swap-Datei konnte nicht erzeugt werden."
+  else
+    truncate -s 0 "$new"
+    chattr +C "$new"
+    fallocate -l "$size" "$new" || swap_fail "Swap-Datei konnte nicht erzeugt werden."
+    chmod 600 "$new"
+    mkswap "$new" >/dev/null || swap_fail "mkswap ist fehlgeschlagen."
+  fi
+
+  # 4. fstab: alte Zeile auskommentieren, neue eintragen
+  if [[ -n "$old_path" && "$old_path" != "$new" ]]; then
+    tmp="${fstab}.new"
+    awk -v old="$old_path" '
+      $0 !~ /^[[:space:]]*#/ && $1 == old && $3 == "swap" { print "#OLD-SWAP " $0; next }
+      { print }
+    ' "$fstab" > "$tmp"
+    mv "$tmp" "$fstab"
+  fi
+  if ! grep -Eq '^/swap/swapfile[[:space:]]+none[[:space:]]+swap' "$fstab"; then
+    echo "/swap/swapfile none swap defaults 0 0" >> "$fstab"
+  fi
+  systemctl daemon-reload
+
+  # 5. Aktivieren und pruefen
+  swapon "$new" || swap_fail "swapon ${new} ist fehlgeschlagen."
+  if ! swapon --noheadings --raw --show=NAME | grep -qx "$new"; then
+    swap_fail "$new ist nach swapon nicht in der Swap-Liste."
+  fi
+  if [[ -n "$old_path" && "$old_path" != "$new" ]]; then
+    rm -f "$old_path"
+    systemctl reset-failed "$(systemd-escape -p --suffix=swap "$old_path")" 2>/dev/null || true
+  fi
+  echo ">>> Swap aktiv:"
+  swapon --show
+  echo ">>> Sicherung der alten fstab: $bk/fstab"
+}
+
 if [[ $MODE_FIXBOOT -eq 1 ]]; then
   fix_boot
+  exit $?
+fi
+
+if [[ $MODE_FIXSWAP -eq 1 ]]; then
+  fix_swap
   exit $?
 fi
 

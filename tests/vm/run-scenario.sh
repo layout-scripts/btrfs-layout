@@ -41,7 +41,7 @@ verify_migrated() { # label
   expect_match   "GRUB liest /@/boot (nicht den Top-Level)" 'BOOT_IMAGE=(\([^)]*\))?/@/boot/' "$(vm 'cat /proc/cmdline')"
   expect_match   "rootflags=subvol=@ gesetzt"         'rootflags=subvol=@( |$)' "$(vm 'cat /proc/cmdline')"
   expect_match   "Default-Subvolume bleibt Top-Level" 'FS_TREE'       "$(vm 'btrfs subvolume get-default /')"
-  if [[ ( $sc == a || $sc == k ) && $legacy -eq 0 ]]; then
+  if [[ $sc == a || $sc == k ]]; then
     expect_match "Swap-Datei aktiv unter /swap"       '/swap/swapfile' "$(vm 'swapon --show --noheadings')"
   fi
   if [[ $mk -eq 1 ]]; then
@@ -118,10 +118,21 @@ if [[ $legacy -eq 1 ]]; then
   expect_match   "Altzustand: GRUB liest /boot im Top-Level" 'BOOT_IMAGE=(\([^)]*\))?/boot/' "$(vm 'cat /proc/cmdline')"
   expect_nomatch "Altzustand: kein rootflags"           'rootflags=' "$(vm 'cat /proc/cmdline')"
   expect_match   "Altzustand: Default-Subvolume ist @"  'path @$' "$(vm 'btrfs subvolume get-default /')"
+  expect_nomatch "Altzustand: Swap-Datei ist nicht aktiv (CoW-Kopie)" '[A-Za-z]' "$(vm 'swapon --show --noheadings')"
+  expect_match   "Altzustand: fstab verweist noch auf /swap.img" '/swap.img' "$(vm 'grep -v "^#" /etc/fstab | grep swap')"
   echo "== --fix-boot"
   out=$(vm "/root/setup-btrfs.sh --fix-boot --yes 2>&1; echo EXIT=\$?")
   echo "$out" | tail -12 | sed 's/^/    /'
   expect_match "--fix-boot endet mit Exit 0" 'EXIT=0$' "$out"
+  echo "== --fix-swap"
+  out=$(vm "/root/setup-btrfs.sh --fix-swap --yes 2>&1; echo EXIT=\$?")
+  echo "$out" | tail -8 | sed 's/^/    /'
+  expect_match "--fix-swap endet mit Exit 0" 'EXIT=0$' "$out"
+  expect_match "Swap sofort aktiv (ohne Reboot)" '/swap/swapfile' "$(vm 'swapon --show --noheadings')"
+  expect_match "alte fstab-Zeile auskommentiert" '#OLD-SWAP' "$(vm 'grep OLD-SWAP /etc/fstab')"
+  expect_match "@swap gemountet" '\[/@swap\]' "$(vm 'findmnt -no SOURCE /swap')"
+  expect_match "alte Datei geloescht" '^gone$' "$(vm 'test -e /swap.img || echo gone')"
+  expect_match "zweiter Aufruf: nichts zu tun" 'nichts zu tun' "$(vm '/root/setup-btrfs.sh --fix-swap --yes 2>&1')"
   echo "== Reboot 1"
   "$VM" reboot "$sc" || { bad "VM kommt nach --fix-boot nicht hoch"; exit 1; }
   verify_migrated "nach --fix-boot"
