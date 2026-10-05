@@ -345,11 +345,25 @@ install_apt_hooks() {
       return 0
     fi
     if ! grep -Fqx "$marker" "$hook_conf" && ! grep -Fqx "$legacy_marker" "$hook_conf"; then
-      echo "FEHLER: $hook_conf existiert, ist aber nicht von diesem Skript verwaltet." >&2
-      echo "Bitte manuell prüfen oder verschieben, damit keine fremden apt-Hooks überschrieben werden." >&2
-      exit 1
+      # Das Paket snapper liefert unter genau diesem Namen eigene Hooks (Conffile). Sie wuerden
+      # zusaetzlich zu unseren laufen und doppelte Snapshots anlegen. Per dpkg-divert beiseite
+      # legen: Die Datei bleibt erhalten, Paket-Updates schreiben in die umgeleitete Datei, und
+      # apt ignoriert die Endung ".distrib". Alles andere ist wirklich fremd: abbrechen.
+      owner=$(dpkg -S "$hook_conf" 2>/dev/null | head -n1 | cut -d: -f1 || true)
+      if [[ "$owner" == "snapper" ]]; then
+        echo ">>> $hook_conf gehört zum Paket snapper und wird per dpkg-divert nach ${hook_conf}.distrib verlegt."
+        dpkg-divert --local --rename --divert "${hook_conf}.distrib" --add "$hook_conf"
+      else
+        echo "FEHLER: $hook_conf existiert, ist aber nicht von diesem Skript verwaltet." >&2
+        echo "Bitte manuell prüfen oder verschieben, damit keine fremden apt-Hooks überschrieben werden." >&2
+        exit 1
+      fi
     fi
-    echo ">>> apt-Hooks für snapper sind veraltet, aktualisiere $hook_conf"
+    if [[ -f "$hook_conf" ]]; then
+      echo ">>> apt-Hooks für snapper sind veraltet, aktualisiere $hook_conf"
+    else
+      echo ">>> Installiere apt-Hooks für Pre-/Post-Snapshots: $pre_script, $post_script, $hook_conf"
+    fi
   else
     echo ">>> Installiere apt-Hooks für Pre-/Post-Snapshots: $pre_script, $post_script, $hook_conf"
   fi
