@@ -92,8 +92,8 @@ while [[ $# -gt 0 ]]; do
     --finish-migration) MODE_FINISH=1 ;;
     --cleanup-old-root) MODE_CLEANUP=1 ;;
     --fix-boot) MODE_FIXBOOT=1 ;;
-    --subvols) SUBVOLS_ARG="${2:?--subvols braucht eine Liste}"; shift ;;
-    --map) EXTRA_MAP_SPECS+=("${2:?--map braucht PFAD:@NAME[:ALGO]}"); shift ;;
+    --subvols) [[ $# -ge 2 ]] || { echo "--subvols braucht eine Liste." >&2; exit 2; }; SUBVOLS_ARG="$2"; shift ;;
+    --map) [[ $# -ge 2 ]] || { echo "--map braucht PFAD:@NAME[:ALGO]." >&2; exit 2; }; EXTRA_MAP_SPECS+=("$2"); shift ;;
     --yes|-y) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unbekannte Option: $1" >&2; usage >&2; exit 2 ;;
